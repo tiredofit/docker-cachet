@@ -1,0 +1,82 @@
+version: '2'
+
+services:
+
+  cachet-app:
+    image: tiredofit/cachet
+    container_name: cachet-app
+    links:
+    - cachet-db
+    volumes:
+    ### If you want to perform customizations to the source and have access to it, then uncomment this line - This includes modules
+    #- ./data:/www/html
+    ### Or, if you just want to use Stock cachet and hold onto persistent files like cache and session use this, one or the other.
+    - ./data:/data
+    - ./logs/:/www/logs
+    environment:
+    - VIRTUAL_HOST=cachet.example.com
+    - VIRTUAL_NETWORK=nginx-proxy
+    - VIRTUAL_PORT=80
+    - LETSENCRYPT_HOST=cachet.example.com
+    - LETSENCRYPT_EMAIL=admin@example.com
+
+    - ZABBIX_HOSTNAME=cachet-app
+
+    - DB_HOST=cachet-db
+    - DB_NAME=cachet
+    - DB_USER=cachet
+    - DB_PASS=cachet
+
+    - SITE_URL=https://cachet.example.com
+    - ADMIN_EMAIL=admin@admin.com
+    - ADMIN_USER=admin
+    - ADMIN_PASS=cachet
+    - TIMEZONE=America/Vancouver
+    networks:
+      - proxy-tier
+    restart: always
+
+  cachet-db:
+    image: tiredofit/mariadb
+    container_name: cachet-db
+    volumes:
+      - ./db:/var/lib/mysql
+    environment:
+      - ROOT_PASS=password
+      - DB_NAME=cachet
+      - DB_USER=cachet
+      - DB_PASS=cachet
+
+      - ZABBIX_HOSTNAME=cachet-db
+    networks:
+      - proxy-tier
+    restart: always
+
+  cachet-db-backup:
+    container_name: cachet-db-backup
+    image: tiredofit/db-backup
+    links:
+     - cachet-db
+    volumes:
+      - ./dbbackup:/backup
+    environment:
+      - ZABBIX_HOSTNAME=cachet-db-backup
+      - DB_HOST=cachet-db
+      - DB_TYPE=mariadb
+      - DB_NAME=cachet
+      - DB_USER=cachet
+      - DB_PASS=cachet
+      - DB_DUMP_FREQ=1440
+      - DB_DUMP_BEGIN=0000
+      - DB_CLEANUP_TIME=8640
+      - COMPRESSION=BZ
+      - MD5=TRUE
+    networks:
+      - proxy-tier
+    restart: always
+
+
+networks:
+  proxy-tier:
+    external:
+      name: nginx-proxy

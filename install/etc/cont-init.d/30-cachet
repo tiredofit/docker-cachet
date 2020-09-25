@@ -1,0 +1,229 @@
+#!/usr/bin/with-contenv bash
+
+source /assets/functions/00-container
+prepare_service
+PROCESS_NAME="cachet"
+
+check_service_initialized init 20-php-fpm
+
+### Sanity Test
+sanity_db
+sanity_var ADMIN_EMAIL "Admin Email Address"
+sanity_var ADMIN_PASS "Admin Password"
+sanity_var SITE_URL "Site URL"
+db_ready mariadb
+
+### Logfile redirection
+mkdir -p /www/logs/cachet
+chown -R "${NGINX_USER}":"${NGINX_GROUP}" /www/logs/cachet
+if [ -d "${NGINX_WEBROOT}/storage/logs" ] ; then rm -rf "${NGINX_WEBROOT}"/storage/logs ; else mkdir -p ${NGINX_WEBROOT}/storage ; fi ;
+ln -sf /www/logs/cachet "${NGINX_WEBROOT}"/storage/logs
+
+### Check if New Install
+if [ ! -f "${NGINX_WEBROOT}/server.php" ]; then
+    print_warn "Potential New Installation / Standalone Installation Detected - Copying Cachet Sourcecode"
+    cp -R /assets/install/* "${NGINX_WEBROOT}"
+
+    ### If running with /www/html or NGINX_WEBROOT mapped, then create persistent storage
+    ### Storage redirection
+    if [ -d "/data" ]; then
+        print_warn "Detected /data directory. Persistently saving settings/sessions/cache/uploads/modules"
+        if [ ! -d "/data/storage" ]; then
+            cp -R "${NGINX_WEBROOT}"/storage /data
+        fi
+        rm -rf "${NGINX_WEBROOT}"/storage
+        ln -s /data/storage "${NGINX_WEBROOT}"/storage
+        ln -sf /data/config "${NGINX_WEBROOT}"/.env
+        touch /data/config
+        chown "${NGINX_USER}":"${NGINX_GROUP}" "${NGINX_WEBROOT}"/.env
+        ln -sf /data/.cachet-version "${NGINX_WEBROOT}"/.cachet-version
+        chown -R "${NGINX_USER}":"${NGINX_GROUP}" /data
+    fi
+
+    ### Auto Upgrade functionality
+    if [ ! -f "${NGINX_WEBROOT}/.cachet-version" ]; then
+        echo "${CACHET_VERSION} first installed on $(date)" >> "${NGINX_WEBROOT}"/.cachet-version
+    fi
+    chown -R "${NGINX_USER}":"${NGINX_GROUP}" "${NGINX_WEBROOT}"
+else
+    if [ "$ENABLE_AUTO_UPDATE" = "TRUE" ]; then
+        if [ "$CACHET_VERSION" != $(head -n 1 "${NGINX_WEBROOT}"/.cachet-version | awk '{print $1'}) ]; then
+        print_warn "Detected in place Cachet version $(head -n 1 "${NGINX_WEBROOT}"/.cachet-version | awk "{print $1"}) - Upgrading to ${CACHET_VERSION}"
+            cp -R /assets/install/* "${NGINX_WEBROOT}"
+            chown -R "${NGINX_USER}":"${NGINX_GROUP}" "${NGINX_WEBROOT}"
+            cd "${NGINX_WEBROOT}"|| exit
+            silent sudo -u "${NGINX_USER}" php artisan app:update
+            UPGRADE=TRUE
+            sed -i --follow-symlinks "1 i\
+            ${CACHET_VERSION} upgraded on $(date)" /www/html/.cachet-version
+        fi
+    fi
+fi
+
+## Copy over any custom files overtop of source
+if [ -d "/assets/custom" ]; then
+    print_warn "Detected Custom Source - Copying over to application"
+    cp -R /assets/custom/* "${NGINX_WEBROOT}"/
+    chown -R "${NGINX_USER}":"${NGINX_GROUP}" "${NGINX_WEBROOT}"
+fi
+
+## Execute Custom Scripts
+if [ -d /assets/custom-scripts/ ] ; then
+    print_warn "Found Custom Scripts to Execute"
+    for f in $(find /assets/custom-scripts/ -name \*.sh -type f); do
+        print_warn "Running Script ${f}"
+        chmod +x "${f}"
+        ${f}
+    done
+fi
+
+### Dynamically Create Configuration
+if ! grep -q "APP_URL" "${NGINX_WEBROOT}"/.env > /dev/null 2>&1; then
+    print_debug "Didn't find APP_URL in .env - Assuming new install"
+    if [ "$SETUP_TYPE" = "AUTO" ]; then
+        print_info "Auto Configuring based on Environment Variables"
+        APP_KEY=${APP_KEY:-"$(silent sudo -u ${NGINX_USER} php /www/html/artisan key:generate --show)"}
+        ### Write the Configuration File
+        sleep 1
+        cat >"${NGINX_WEBROOT}/.env" <<EOF
+## Custom Generated Cachet Configuration! Do not edit, instead set ENV Vars
+## If you want to use your own configuration files set SETUP_TYPE=MANUAL when starting container
+## Last Generated on $(date)
+
+APP_ENV=production
+APP_DEBUG=${APP_DEBUG}
+APP_KEY=${APP_KEY}
+APP_URL=${SITE_URL}
+APP_TIMEZONE=${TIMEZONE}
+DEBUGBAR_ENABLED=${ENABLE_DEBUG_BAR}
+
+DB_DRIVER=${DB_TYPE}
+DB_HOST=${DB_HOST}
+DB_UNIX_SOCKET=null
+DB_DATABASE=${DB_NAME}
+DB_USERNAME=${DB_USER}
+DB_PASSWORD=${DB_PASS}
+DB_PORT=${DB_PORT}
+DB_PREFIX=${DB_PREFIX:-"null"}
+
+CACHE_DRIVER=${DRIVER_CACHE}
+SESSION_DRIVER=${DRIVER_SESSION}
+QUEUE_DRIVER=${DRIVER_QUEUE}
+
+CACHET_BEACON=false
+CACHET_EMOJI=false
+CACHET_AUTO_TWITTER=false
+
+MAIL_DRIVER=log
+MAIL_HOST=null
+MAIL_PORT=null
+MAIL_USERNAME=null
+MAIL_PASSWORD=null
+MAIL_ADDRESS=${MAIL_FROM}
+MAIL_NAME=${MAIL_FROM_NAME}
+MAIL_ENCRYPTION=null
+
+REDIS_HOST=null
+REDIS_DATABASE=null
+REDIS_PORT=null
+
+GITHUB_TOKEN=null
+
+NEXMO_KEY=null
+NEXMO_SECRET=null
+NEXMO_SMS_FROM=null
+
+TRUSTED_PROXIES=
+EOF
+
+        ## Generate Cache and Key
+        cd "${NGINX_WEBROOT}"/
+        chown -R "${NGINX_USER}":"${NGINX_GROUP}" "${NGINX_WEBROOT}"/config
+        if [ -f /data/config ]; then
+            chown "${NGINX_USER}":"${NGINX_GROUP}" /data/config
+            chmod 0755 /data/config
+        fi
+        #silent sudo -u "${NGINX_USER}" php artisan config:cache
+        #silent sudo -u "${NGINX_USER}" php artisan key:generate --force
+        silent sudo -u "${NGINX_USER}" php artisan config:cache
+    fi
+fi
+
+### Cleanup
+cd "${NGINX_WEBROOT}"/
+
+### Check to see if DB is populated
+mysql -u $DB_USER -p$DB_PASS -h$DB_HOST -e "use "$DB_NAME"; SELECT * FROM users;" > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    ### Perform Database Installtion Routines
+    print_warn "Detected empty Database - Setting up - Please wait.."
+    sleep 5
+    cd ${NGINX_WEBROOT}
+    # First One Fails
+#    silent /usr/bin/expect<<EOD
+#spawn sudo -u "${NGINX_USER}" php artisan cachet:install --no-ansi
+#set timeout 999
+#expect \
+#{
+#  "Do you want to configure Cachet before installing? (yes/no)" {exp_send no\r;exp_continue}
+#  "Do you really wish to run this command? (yes/no)" {exp_send yes\r;exp_continue}
+#  eof {}
+#}
+#EOD
+    php artisan cachet:install --no-interaction
+    php artisan migrate --force
+    php artisan db:seed --force
+    php artisan config:cache
+
+    if var_true ${ENABLE_BEACON} ; then q_beacon="yes" ; else q_beacon="no" ; fi ;
+    if var_true ${ENABLE_EMOJI} ; then q_emoji="yes" ; else q_emoji="no" ; fi ;
+    #silent /usr/bin/expect<<EOD
+#spawn sudo -u "${NGINX_USER}" php artisan cachet:install --no-ansi
+#set timeout 30
+#expect \
+#{
+#  "Do you want to configure Cachet before installing? (yes/no)" {exp_send yes\r;exp_continue}
+#  "Do you really wish to run this command? (yes/no)" {exp_send yes\r;exp_continue}
+#  "Which database driver do you want to use?" {exp_send mysql\r;exp_continue}
+#  "What is the host of your mysql database?" {exp_send $DB_HOST\r;exp_continue}
+#  "What is the name of the database that Cachet should use?" {exp_send $DB_NAME\r;exp_continue}
+#  "What username should we connect with?" {exp_send $DB_USER\r;exp_continue}
+#  "What password should we connect with?" {exp_send $DB_PASS\r;exp_continue}
+#  "Is your database listening on a non-standard port number?" {exp_send yes\r;exp_continue}
+#  "What port number is your database using?" {exp_send ${DB_PORT}\r;exp_continue}
+#  "Do you want to use a prefix on the table names?" {exp_send no\r;exp_continue}
+#  "Are these settings correct? (yes/no)" {exp_send yes\r;exp_continue}
+#  "Which cache driver do you want to use?" {exp_send ${DRIVER_CACHE}\r;exp_continue}
+#  "Which session driver do you want to use?" {exp_send ${DRIVER_SESSION}\r;exp_continue}
+#  "Which queue driver do you want to use?" {exp_send ${DRIVER_QUEUE}\r;exp_continue}
+#  "Are these settings correct? (yes/no)" {exp_send yes\r;exp_continue}
+#  "Do you want Cachet to send mail notifications? (yes/no)" {exp_send yes\r;exp_continue}
+#  "What driver do you want to use to send notifications?" {exp_send log\r;exp_continue}
+#  "Are these settings correct? (yes/no)" {exp_send yes\r;exp_continue}
+#  "Do you wish to use Cachet Beacon?" {exp_send ${q_beacon}\r;exp_continue}
+#  "Do you wish to use Emoji? This requires a GitHub oAuth Token! (yes/no)" {exp_send ${q_emoji}\r;exp_continue}
+#  "Do you want to create an admin user? (yes/no)" {exp_send yes\r;exp_continue}
+#  "Please enter your username" {exp_send $ADMIN_USER\r;exp_continue}
+#  "Please enter your email" {exp_send $ADMIN_EMAIL\r;exp_continue}
+#  "Please enter your password" {exp_send $ADMIN_PASS\r;exp_continue}
+#  eof {}
+#}
+#EOD
+fi
+
+cd "${NGINX_WEBROOT}"
+chown -R "${NGINX_USER}":"${NGINX_GROUP}" storage
+chmod -R ug+rwx storage
+chown -R "${NGINX_USER}":"${NGINX_GROUP}" "${NGINX_WEBROOT}"
+chmod ug+rwx "${NGINX_WEBROOT}"
+chown -R "${NGINX_USER}":"${NGINX_GROUP}" /www/logs/
+
+### Add alias for running artisan
+echo "alias artisan='cd ""${NGINX_WEBROOT}""; sudo -u ""${NGINX_USER}"" php artisan' " > /root/.bashrc
+
+cd "${NGINX_WEBROOT}"
+#silent sudo -u "${NGINX_USER}" php artisan config:clear
+
+print_info "Initialization Complete. Please visit ${SITE_URL} and login with your credentials.."
+
+liftoff
